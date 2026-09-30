@@ -1,0 +1,4 @@
+{
+    "symbols": ["btcusdt", "ethusdt", "solusdt"],
+    "streams": ["bookTicker", "ticker"]
+}

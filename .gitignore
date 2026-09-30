@@ -1,0 +1,5 @@
+__pycache__/
+grafana_data/
+notebooks/
+redis_data/
+kafka_data/

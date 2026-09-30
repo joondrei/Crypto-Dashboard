@@ -1,0 +1,151 @@
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis_db
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - app-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    hostname: kafka 
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft Settings
+      KAFKA_NODE_ID: 1
+      #Broker handles the data, it stores message and serves the producers and consumers
+      #Controller handles the cluster, it stores the metadata of the cluster
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      #Querom voters are the nodes that are used to make decisions in the cluster
+      #In this case, we have only one node, so we use 1@kafka:29093 where 1 is the node id and kafka is the hostname, 29093 is the controller port
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      
+      #Listeners are the ports that the broker uses to communicate with the clients
+      #PLAINTEXT://kafka:29092 listens to container to container communication
+      #CONTROLLER://kafka:29093 listens to broker to controller communication
+      #PLAINTEXT_HOST://0.0.0.0:9092 listens to host to container communication
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      #Listeners is the network interfaces that kafka binds to, and opens sockets to accept web connections
+      #Advertised listeners is the network interfaces that kafka announces to the clients
+      # This is use fil because kafka is port 29092 is where kafak is at, but host machine is port 9092
+      # So we use 9092 for the host machine and 29092 for the container
+      
+      #Listener security protocol map is the security protocol that the broker uses to communicate with the clients
+      #CONTROLLER:PLAINTEXT is the security protocol that the controller uses to communicate with the broker
+      #PLAINTEXT:PLAINTEXT is the security protocol that the broker uses to communicate with the clients
+      #PLAINTEXT_HOST:PLAINTEXT is the security protocol that the broker uses to communicate with the clients from the host machine
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      
+      #Inter broker listener name is the name of the listener that the broker uses to communicate with other brokers
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      
+      #Cluster settings
+      #Offset topic replication factor is the number of replicas for the offset topic
+      #Transaction state log min ISR is the minimum number of in-sync replicas for the transaction state log
+      #Transaction state log replication factor is the number of replicas for the transaction state log
+      #Group initial rebalance delay is the delay before the group rebalances
+      #Auto create topics enable is the flag that enables the auto creation of topics
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3 
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      
+    volumes:
+      - ./kafka_data:/var/lib/kafka/data
+    networks:
+      - app-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka_ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      - kafka
+    networks:
+      - app-network
+
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:7.6.0
+    container_name: kafka-connect
+    depends_on:
+      - kafka
+      - redis
+    ports:
+      - "8083:8083"
+    networks:
+      - app-network
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: 'kafka:29092'
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: compose-connect-group
+      CONNECT_CONFIG_STORAGE_TOPIC: docker-connect-configs
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_TOPIC: docker-connect-offsets
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_TOPIC: docker-connect-status
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/filestream-connectors,/usr/share/confluent-hub-components"
+    command:
+      - bash
+      - -c
+      - |
+        echo "Installing Redis Connector..."
+        confluent-hub install --no-prompt redis/redis-kafka-connect:latest
+        echo "Installing Connect Transforms SMTs..."
+        confluent-hub install --no-prompt confluentinc/connect-transforms:latest
+        # Launch Kafka Connect entrypoint
+        /etc/confluent/docker/run
+
+  jupyter-pyspark:
+    image: jupyter/pyspark-notebook:latest
+    container_name: jupyter-spark
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    volumes:
+      - ./notebooks:/home/jovyan/work
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+    networks:
+      - app-network
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana_boot
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - ./grafana_data:/var/lib/grafana
+    depends_on:
+      - redis
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
