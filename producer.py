@@ -21,7 +21,6 @@ logging.basicConfig(
     format="%(asctime)s [PRODUCER] %(levelname)s %(message)s"
 )
 log = logging.getLogger(__name__)
-topic_name = "crypto.livestream"
 
 streamconfigfile = "stream_config.json"
 stream_loader = StreamLoader(streamconfigfile)
@@ -60,10 +59,7 @@ def on_message(ws, message):
             log.error(f"Error unhandled stream: {stream_name}")
             return
 
-        for (key, value) in data.items():
-            if value == None:
-                log.error(f"Error {key} is None")
-                return
+
         if stream_type == "ticker":
             record = {
                 'symbol': data.get('s', None).upper(),
@@ -80,13 +76,29 @@ def on_message(ws, message):
                 'high_price': float(data.get('h', None)),
                 'low_price': float(data.get('l', None)),
             }
-            
 
+        if "kline" in stream_type:
+            stream_type, interval = stream_type.split('_')
+            record = {
+                'symbol': data.get('s', None).upper(),
+                'interval': interval
+                # 'timestamp': int(data.get('E', None)),
+            }
+            kline = data.get('k', None)
+            record["timestamp"] = int(kline.get('t', None))
+            # record["close_time"] = kline.get('T', None)
+            record["open_price"] = float(kline.get('o', None))
+            record["close_price"] = float(kline.get('c', None))
+            record["high_price"] = float(kline.get('h', None))
+            record["low_price"] = float(kline.get('l', None))
+            
+        # for (key, value) in data.items():
+        #     if value == None:
+        #         log.error(f"Error {key} is None")
+        #         return
         
-        if data.get('E'):
-            timestamp = int(data.get('E')) 
         record['timestamp'] = datetime.fromtimestamp(
-                            timestamp / 1000, tz=timezone.utc
+                            record['timestamp'] / 1000, tz=timezone.utc
                             ).isoformat()
 
         send_to_kafka(record, stream_type)
@@ -106,15 +118,15 @@ def on_open(ws):
 def send_to_kafka(data, stream_type):
     """Send fully filled, zero-null message to Kafka with symbol as partition key"""
     try:
-        partition_key = f"{data['symbol']}:{stream_type}"
+        partition_key = f"{data['symbol']}"
         
         producer.send(
-            topic=topic_name,
+            topic=stream_type,
             key=partition_key.encode('utf-8'),
             value=json.dumps(data).encode('utf-8')
         )
         
-        log.info(f"[ticker Event] Published complete record for {partition_key}")
+        log.info(f"[{stream_type} Event] Published complete record for {partition_key}")
         
     except Exception as e:
         log.error(f"Failed to send complete record to Kafka: {e}")

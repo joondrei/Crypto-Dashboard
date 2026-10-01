@@ -1,4 +1,4 @@
 {
     "symbols": ["btcusdt", "ethusdt", "solusdt"],
-    "streams": ["ticker"]
+    "streams": ["ticker", "kline_1s", "kline_1m", "kline_5m"]
 }

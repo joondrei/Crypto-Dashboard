@@ -114,8 +114,47 @@ services:
         confluent-hub install --no-prompt redis/redis-kafka-connect:latest
         echo "Installing Connect Transforms SMTs..."
         confluent-hub install --no-prompt confluentinc/connect-transforms:latest
-        # Launch Kafka Connect entrypoint
-        /etc/confluent/docker/run
+        
+        /etc/confluent/docker/run &
+        
+        echo "Waiting for Kafka Connect REST API to boot up..."
+        until $(curl --output /dev/null --silent --head --fail http://localhost:8083/connectors); do
+            sleep 5
+        done
+        echo "Kafka Connect is ready. Registering connectors..."
+
+        curl -X POST -H "Content-Type: application/json" --data '{
+          "name": "redis-hash-sink-connector",
+          "config": {
+            "connector.class": "com.redis.kafka.connect.RedisSinkConnector",
+            "tasks.max": "1",
+            "topics": "ticker",
+            "redis.host": "redis",
+            "redis.port": "6379",
+            "redis.command": "HSET",
+            "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+            "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+            "value.converter.schemas.enable": "false" 
+          }
+        }' http://localhost:8083/connectors
+
+        curl -X POST -H "Content-Type: application/json" --data '{
+          "name": "redis-stream-sink-connector",
+          "config": {
+            "connector.class": "com.redis.kafka.connect.RedisSinkConnector",
+            "tasks.max": "1",
+            "topics": "kline",
+            "redis.host": "redis",
+            "redis.port": "6379",
+            "redis.type": "STREAM",
+            "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+            "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+            "value.converter.schemas.enable": "false" 
+          }
+        }' http://localhost:8083/connectors
+
+        echo "Connectors successfully provisionsed!"
+        wait
 
   jupyter-pyspark:
     image: jupyter/pyspark-notebook:latest
@@ -130,21 +169,6 @@ services:
     command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
     networks:
       - app-network
-
-  # grafana:
-  #   image: grafana/grafana-oss:latest
-  #   container_name: grafana_boot
-  #   restart: always
-  #   ports:
-  #     - "3000:3000"
-  #   environment:
-  #     - GF_INSTALL_PLUGINS=redis-datasource
-  #   volumes:
-  #     - ./grafana_data:/var/lib/grafana
-  #   depends_on:
-  #     - redis
-  #   networks:
-  #     - app-network
 
   streamlit-app:
     build:
