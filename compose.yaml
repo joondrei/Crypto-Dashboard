@@ -131,20 +131,37 @@ services:
     networks:
       - app-network
 
-  grafana:
-    image: grafana/grafana-oss:latest
-    container_name: grafana_boot
-    restart: always
+  # grafana:
+  #   image: grafana/grafana-oss:latest
+  #   container_name: grafana_boot
+  #   restart: always
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_INSTALL_PLUGINS=redis-datasource
+  #   volumes:
+  #     - ./grafana_data:/var/lib/grafana
+  #   depends_on:
+  #     - redis
+  #   networks:
+  #     - app-network
+
+  streamlit-app:
+    build:
+      context: .
+      dockerfile: streamlitdocker
+    container_name: streamlit_container
     ports:
-      - "3000:3000"
-    environment:
-      - GF_INSTALL_PLUGINS=redis-datasource
+      - "8501:8501"
     volumes:
-      - ./grafana_data:/var/lib/grafana
-    depends_on:
-      - redis
+      - .:/app
+      - /app/.venv
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
     networks:
       - app-network
+
 
 networks:
   app-network:

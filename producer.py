@@ -23,10 +23,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 topic_name = "crypto.livestream"
 
-streamconfigfile = "../stream_config.json"
+streamconfigfile = "stream_config.json"
 stream_loader = StreamLoader(streamconfigfile)
 
-configfile = "../kafka.env"
+configfile = "kafka.env"
 config = ConfigLoader(configfile)
 producer_config = config.to_kafka_dict()
 
@@ -37,7 +37,6 @@ producer = KafkaProducer(
 
 
 ws = None
-market_state_cache = {}
 
 def handle_shutdown(signum, frame):
     """Callback function triggered when Ctrl+C or terminal termination is requested"""
@@ -54,43 +53,43 @@ def on_message(ws, message):
         data = payload.get('data')
 
         if not data or not stream_name:
+            log.error(f"Error empty message")
+            return
+        stream_type = stream_name.split('@')[1] 
+        if stream_type not in stream_loader.streams:
+            log.error(f"Error unhandled stream: {stream_name}")
             return
 
-        symbol = data.get('s').upper()
-        
-        if symbol not in market_state_cache:
-            market_state_cache[symbol] = {
-                'symbol': symbol,
-                'timestamp': int(datetime.now(timezone.utc).timestamp() * 1000),
-                'bid_price': 0.0,
-                'ask_price': 0.0,
-                'spread': 0.0,
-                'last_price': 0.0,
-                'pct_change': 0.0
+        for (key, value) in data.items():
+            if value == None:
+                log.error(f"Error {key} is None")
+                return
+        if stream_type == "ticker":
+            record = {
+                'symbol': data.get('s', None).upper(),
+                'timestamp': int(data.get('E', None)) ,
+                'bid_price': float(data.get('b', None)),
+                'bid_qty': float(data.get('B', None)),
+                'ask_price': float(data.get('a', None)),
+                'ask_qty': float(data.get('A', None)),
+                # 'spread': float(data.get('c', None)),
+                'last_price': float(data.get('c', None)),
+                'pct_change': float(data.get('P', None)),
+                'avg_price': float(data.get('w', None)),
+                'open_price': float(data.get('o', None)),
+                'high_price': float(data.get('h', None)),
+                'low_price': float(data.get('l', None)),
             }
-        
-        state = market_state_cache[symbol]
-        
-        if "bookTicker" in stream_name:
-            bid_price = float(data.get('b', 0))
-            ask_price = float(data.get('a', 0))
             
-            state['bid_price'] = bid_price
-            state['ask_price'] = ask_price
-            state['spread'] = round(ask_price - bid_price, 2)
-            state['timestamp'] = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-        elif "ticker" in stream_name:
-            state['last_price'] = float(data.get('c', 0))
-            state['pct_change'] = float(data.get('P', 0))
-            if data.get('E'):
-                state['timestamp'] = int(data.get('E')) 
-        else:
-            return
+        
+        if data.get('E'):
+            timestamp = int(data.get('E')) 
+        record['timestamp'] = datetime.fromtimestamp(
+                            timestamp / 1000, tz=timezone.utc
+                            ).isoformat()
 
-        flat_complete_record = state.copy()
-
-        send_to_kafka(flat_complete_record, triggered_by="bookTicker" if "bookTicker" in stream_name else "ticker")
+        send_to_kafka(record, stream_type)
 
     except Exception as e:
         log.error(f"Error merging stream states: {e}")
@@ -104,10 +103,10 @@ def on_close(ws, close_status_code, close_msg):
 def on_open(ws):
     print("Connected to Binance Combined Streams API")
 
-def send_to_kafka(data, triggered_by):
+def send_to_kafka(data, stream_type):
     """Send fully filled, zero-null message to Kafka with symbol as partition key"""
     try:
-        partition_key = data['symbol']
+        partition_key = f"{data['symbol']}:{stream_type}"
         
         producer.send(
             topic=topic_name,
@@ -115,10 +114,7 @@ def send_to_kafka(data, triggered_by):
             value=json.dumps(data).encode('utf-8')
         )
         
-        if triggered_by == 'bookTicker':
-            log.info(f"[bookTicker Event] Published complete state for {partition_key} | Spread: ${data['spread']:.2f}")
-        else:
-            log.info(f"[ticker Event] Published complete state for {partition_key} | Last: ${data['last_price']:.2f} ({data['pct_change']}%)")
+        log.info(f"[ticker Event] Published complete record for {partition_key}")
         
     except Exception as e:
         log.error(f"Failed to send complete record to Kafka: {e}")

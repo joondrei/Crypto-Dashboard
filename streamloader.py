@@ -12,16 +12,16 @@ class StreamLoader:
             with open(self.config_path, 'r') as file:
                 config = json.load(file)
             
-            symbols = config.get("symbols", [])
-            streams = config.get("streams", [])
+            self.symbols = config.get("symbols", [])
+            self.streams = config.get("streams", [])
             
-            if not symbols or not streams:
+            if not self.symbols or not self.streams:
                 raise ValueError("Config file must contain at least one symbol and one stream type.")
             
             # Combine every symbol with every stream type (e.g., btcusdt@bookTicker)
             combined_streams = []
-            for symbol in symbols:
-                for stream in streams:
+            for symbol in self.symbols:
+                for stream in self.streams:
                     # Binance streams must be lowercase
                     combined_streams.append(f"{symbol.lower()}@{stream}")
             
