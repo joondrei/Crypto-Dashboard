@@ -1,418 +1,500 @@
-# import os
-# import threading
-# import time
-# from datetime import datetime, timezone
+"""Stonks — real-time crypto dashboard.
 
-# import altair as alt
-# import pandas as pd
-# import redis
-# import streamlit as st
+Flow: Binance WebSocket -> producer.py -> Kafka (ticker / kline) -> Kafka Connect
+Redis sinks -> this dashboard.
 
-# # ── Page setup ────────────────────────────────────────────────────────────────
-# st.set_page_config(
-#     page_title="Stonks · Live Tickers",
-#     page_icon="📈",
-#     layout="wide",
-# )
+  * ticker data  -> Redis hashes   ``ticker:<SYMBOL>``      (overwritten every tick)
+  * kline data   -> Redis streams  ``kline:<SYMBOL>:<IV>``  (append-only, XADD)
 
-# TICKER_FIELDS = (
-#     "bid_price", "bid_qty", "ask_price", "ask_qty",
-#     "last_price", "pct_change", "avg_price",
-#     "open_price", "high_price", "low_price",
-# )
-# MAX_POINTS = 600  # price points kept per symbol in session history
-# LIVE_POLL_FALLBACK = 0.5  # seconds, used when keyspace notifications are unavailable
-# LIVE_HEARTBEAT = 30.0  # seconds, max wait between refreshes even with no events
-# REFRESH_MODES = ["Live", "1s", "2s", "5s", "10s", "30s", "Off"]
+The dashboard re-renders on a fragment timer (default 1s) so new ticks and candles
+show up without a page reload.
+"""
 
-# GREEN, RED = "#21c354", "#ff4b4b"
+import os
 
+import altair as alt
+import pandas as pd
+import redis
+import streamlit as st
 
-# # ── Redis access ──────────────────────────────────────────────────────────────
-# @st.cache_resource(show_spinner=False)
-# def _redis_client(host: str, port: int) -> redis.Redis:
-#     return redis.Redis(
-#         host=host,
-#         port=port,
-#         decode_responses=True,
-#         socket_connect_timeout=2,
-#         socket_timeout=2,
-#     )
+# ── Page setup ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Stonks · Live Market",
+    page_icon="📈",
+    layout="wide",
+)
 
+GREEN, RED = "#21c354", "#ff4b4b"
+MAX_KLINE_POINTS = 600  # samples pulled per symbol/interval stream
+MAX_CANDLES = 150  # candles drawn when the interval is dense (e.g. 1s)
 
-# def resolve_redis():
-#     """Find a reachable Redis: REDIS_HOST/REDIS_PORT env vars first, then defaults.
+TICKER_FIELDS = (
+    "bid_price", "bid_qty", "ask_price", "ask_qty",
+    "last_price", "pct_change", "avg_price",
+    "open_price", "high_price", "low_price",
+)
 
-#     Tries the docker-network hostname `redis` before localhost so the same code
-#     works both inside the compose stack and when run locally via poetry.
-#     """
-#     candidates = []
-#     if os.environ.get("REDIS_HOST"):
-#         candidates.append((os.environ["REDIS_HOST"], int(os.environ.get("REDIS_PORT", "6379"))))
-#     candidates += [("redis", 6379), ("localhost", 6379), ("127.0.0.1", 6379)]
+# Refresh choices -> value passed to st.fragment(run_every=...)
+REFRESH_MODES = {"1s": "1s", "2s": "2s", "5s": "5s", "10s": "10s", "Off": None}
 
-#     for host, port in dict.fromkeys(candidates):
-#         try:
-#             client = _redis_client(host, port)
-#             client.ping()
-#             return client, host, port
-#         except (redis.RedisError, OSError):
-#             continue
-#     return None, None, None
+CANDLE_X = alt.X("time:T", title=None)
+PRICE_Y = alt.Y("close:Q", title="price", scale=alt.Scale(zero=False))
 
 
-# class RedisChangeTracker:
-#     """Wakes the dashboard the moment a matching Redis key is written.
-
-#     Subscribes to keyspace notifications (`__keyspace@*__:*`) and exposes a
-#     monotonically increasing event counter. Dashboard sessions remember the
-#     counter value they last rendered and sleep until it increases.
-#     """
-
-#     CHANNEL = "__keyspace@*__:*"
-
-#     def __init__(self, client: redis.Redis):
-#         self._client = client
-#         self._cond = threading.Condition()
-#         self._counter = 0
-#         self._stop = threading.Event()
-#         self._live = False  # pubsub connected and receiving events
-#         self._notified = False  # notifications enabled on the server
-#         self._thread: threading.Thread | None = None
-
-#     # -- lifecycle ------------------------------------------------------------
-#     def start(self) -> "RedisChangeTracker":
-#         self._enable_notifications()
-#         self._thread = threading.Thread(target=self._listen, name="redis-change-tracker", daemon=True)
-#         self._thread.start()
-#         return self
-
-#     def _enable_notifications(self) -> None:
-#         """Turn on keyspace events at runtime (no redis.conf change needed)."""
-#         try:
-#             current = self._client.config_get("notify-keyspace-events").get("notify-keyspace-events", "")
-#             wanted = "".join(sorted(set(current.upper()) | set("KEA")))
-#             if wanted != current:
-#                 self._client.config_set("notify-keyspace-events", wanted)
-#             self._notified = True
-#         except (redis.RedisError, OSError):
-#             self._notified = False  # e.g. CONFIG disabled on managed Redis
-
-#     def _listen(self) -> None:
-#         while not self._stop.is_set():
-#             try:
-#                 with self._client.pubsub(ignore_subscribe_messages=True) as pubsub:
-#                     pubsub.psubscribe(self.CHANNEL)
-#                     with self._cond:
-#                         self._live = True
-#                     for message in pubsub.listen():
-#                         if self._stop.is_set():
-#                             break
-#                         with self._cond:
-#                             self._counter += 1
-#                             self._cond.notify_all()
-#             except (redis.RedisError, OSError):
-#                 pass
-#             with self._cond:
-#                 self._live = False
-#             if not self._stop.is_set():
-#                 self._stop.wait(1.0)  # reconnect with a small backoff
-
-#     # -- queries --------------------------------------------------------------
-#     @property
-#     def status(self) -> str:
-#         """One of: 'events' (receiving keyspace events), 'connecting' (pubsub
-#         starting up / retrying), or 'polling' (notifications unsupported)."""
-#         if not self._notified:
-#             return "polling"
-#         return "events" if self._live else "connecting"
-
-#     @property
-#     def notifications_enabled(self) -> bool:
-#         return self._notified
-
-#     def current(self) -> int:
-#         with self._cond:
-#             return self._counter
-
-#     def wait_for_change(self, snapshot: int, timeout: float) -> tuple[int, bool]:
-#         """Block until the counter exceeds `snapshot` (or timeout). Returns (new, fired)."""
-#         with self._cond:
-#             fired = self._cond.wait_for(lambda: self._counter != snapshot, timeout=timeout)
-#             return self._counter, fired
+# ── Redis access ──────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _redis_client(host: str, port: int) -> redis.Redis:
+    return redis.Redis(
+        host=host,
+        port=port,
+        decode_responses=True,
+        socket_connect_timeout=2,
+        socket_timeout=2,
+    )
 
 
-# @st.cache_resource(show_spinner=False)
-# def _change_tracker(host: str, port: int) -> RedisChangeTracker:
-#     return RedisChangeTracker(_redis_client(host, port)).start()
+@st.cache_resource(show_spinner=False)
+def resolve_redis():
+    """Find a reachable Redis: REDIS_HOST/REDIS_PORT first, then docker/localhost."""
+    candidates = []
+    if os.environ.get("REDIS_HOST"):
+        candidates.append((os.environ["REDIS_HOST"], int(os.environ.get("REDIS_PORT", "6379"))))
+    candidates += [("redis", 6379), ("localhost", 6379), ("127.0.0.1", 6379)]
+
+    for host, port in dict.fromkeys(candidates):
+        try:
+            client = _redis_client(host, port)
+            client.ping()
+            return client, host, port
+        except (redis.RedisError, OSError):
+            continue
+    return None, None, None
 
 
-# def load_tickers(client: redis.Redis, pattern: str) -> dict[str, dict]:
-#     """Read every hash matching `pattern` into a {symbol: record} dict."""
-#     tickers: dict[str, dict] = {}
-#     for key in client.scan_iter(match=pattern):
-#         try:
-#             raw = client.hgetall(key)
-#         except redis.ResponseError:
-#             continue  # not a hash (e.g. a string/stream key that happens to match)
-#         if not raw:
-#             continue
-#         record = {"key": key}
-#         for field in TICKER_FIELDS:
-#             try:
-#                 record[field] = float(raw[field])
-#             except (KeyError, TypeError, ValueError):
-#                 record[field] = None
-#         record["timestamp"] = pd.to_datetime(raw["timestamp"]) if raw.get("timestamp") else None
-#         record["symbol"] = raw.get("symbol") or key.split(":")[-2]
-#         tickers[record["symbol"]] = record
-#     return dict(sorted(tickers.items()))
+# ── Loaders ───────────────────────────────────────────────────────────────────
+def load_tickers(client: redis.Redis) -> dict[str, dict]:
+    """Read every ``ticker:<SYMBOL>`` hash into ``{symbol: record}``."""
+    tickers: dict[str, dict] = {}
+    for key in client.scan_iter(match="ticker:*"):
+        try:
+            raw = client.hgetall(key)
+        except redis.RedisError:
+            continue
+        if not raw:
+            continue
+
+        record = {"key": key}
+        for field in TICKER_FIELDS:
+            try:
+                record[field] = float(raw[field])
+            except (KeyError, TypeError, ValueError):
+                record[field] = None
+        record["symbol"] = raw.get("symbol") or key.split(":")[-1]
+        record["timestamp"] = pd.to_datetime(raw["timestamp"]) if raw.get("timestamp") else None
+        tickers[record["symbol"]] = record
+    return dict(sorted(tickers.items()))
 
 
-# def update_history(tickers: dict[str, dict]) -> None:
-#     """Append each *new* exchange tick to the in-session price history.
-
-#     Points are keyed by the tick's own timestamp, so re-reading an unchanged
-#     hash never adds a duplicate point.
-#     """
-#     history: dict[str, list] = st.session_state.setdefault("price_history", {})
-#     for symbol, record in tickers.items():
-#         if record["last_price"] is None:
-#             continue
-#         points = history.setdefault(symbol, [])
-#         tick_ts = record["timestamp"] if record["timestamp"] is not None else pd.Timestamp.now(tz="UTC")
-#         if points and points[-1][0] == tick_ts:
-#             continue
-#         points.append((tick_ts, record["last_price"]))
-#         del points[:-MAX_POINTS]
+def discover_kline_streams(client: redis.Redis) -> dict[str, list[str]]:
+    """Map ``{symbol: [interval, ...]}`` from the ``kline:<SYMBOL>:<INTERVAL>`` keys."""
+    found: dict[str, set[str]] = {}
+    for key in client.scan_iter(match="kline:*"):
+        parts = key.split(":")
+        if len(parts) == 3:
+            found.setdefault(parts[1], set()).add(parts[2])
+    return {symbol: sorted(ivs) for symbol, ivs in sorted(found.items())}
 
 
-# # ── Formatting helpers ────────────────────────────────────────────────────────
-# def fmt_price(value: float | None) -> str:
-#     if value is None:
-#         return "—"
-#     if value >= 1000:
-#         return f"{value:,.2f}"
-#     if value >= 1:
-#         return f"{value:,.4f}".rstrip("0").rstrip(".")
-#     return f"{value:.6f}".rstrip("0").rstrip(".")
+def load_kline(client: redis.Redis, symbol: str, interval: str) -> pd.DataFrame:
+    """Return the last ``MAX_KLINE_POINTS`` candles as a chronological DataFrame."""
+    try:
+        rows = client.xrevrange(f"kline:{symbol}:{interval}", count=MAX_KLINE_POINTS)
+    except redis.RedisError:
+        return pd.DataFrame()
+
+    records = []
+    for _, fields in rows:
+        try:
+            records.append({
+                "time": pd.to_datetime(fields["timestamp"]),
+                "open": float(fields["open_price"]),
+                "high": float(fields["high_price"]),
+                "low": float(fields["low_price"]),
+                "close": float(fields["close_price"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue  # skip malformed entries rather than break the whole panel
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records[::-1]).sort_values("time")
 
 
-# def spread_of(record: dict) -> float | None:
-#     if record["ask_price"] is None or record["bid_price"] is None:
-#         return None
-#     return record["ask_price"] - record["bid_price"]
+# ── Formatting helpers ────────────────────────────────────────────────────────
+def fmt_price(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if value >= 1000:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:,.4f}".rstrip("0").rstrip(".")
+    return f"{value:.6f}".rstrip("0").rstrip(".")
 
 
-# # ── Chart builders ────────────────────────────────────────────────────────────
-# def history_chart() -> alt.Chart | None:
-#     """Line chart of prices observed while the page has been open, rebased to 100."""
-#     rows = []
-#     for symbol, points in st.session_state.get("price_history", {}).items():
-#         if not points:
-#             continue
-#         base = points[0][1]
-#         for ts, price in points:
-#             rows.append({"time": ts, "symbol": symbol, "price": price, "indexed": price / base * 100})
-#     df = pd.DataFrame(rows)
-#     if df.empty or df.groupby("symbol").size().max() < 2:
-#         return None
-#     return alt.Chart(df).mark_line().encode(
-#         x=alt.X("time:T", title=None),
-#         y=alt.Y("indexed:Q", title="price (session start = 100)"),
-#         color=alt.Color("symbol:N", title=None),
-#         tooltip=[
-#             alt.Tooltip("symbol:N", title="Symbol"),
-#             alt.Tooltip("price:Q", title="Price", format=",.4f"),
-#             alt.Tooltip("indexed:Q", title="Index", format=".2f"),
-#         ],
-#     ).interactive()
+def spread_of(record: dict) -> float | None:
+    if record.get("ask_price") is None or record.get("bid_price") is None:
+        return None
+    return record["ask_price"] - record["bid_price"]
 
 
-# def change_chart(tickers: dict[str, dict]) -> alt.Chart:
-#     """Bar chart of the 24h percent change reported by each ticker."""
-#     df = pd.DataFrame([
-#         {"symbol": sym, "pct": rec["pct_change"] if rec["pct_change"] is not None else 0.0}
-#         for sym, rec in tickers.items()
-#     ])
-#     return alt.Chart(df).mark_bar().encode(
-#         x=alt.X("symbol:N", sort=list(df["symbol"]), title=None),
-#         y=alt.Y("pct:Q", title="24h change (%)"),
-#         color=alt.condition("datum.pct >= 0", alt.value(GREEN), alt.value(RED)),
-#         tooltip=[
-#             alt.Tooltip("symbol:N", title="Symbol"),
-#             alt.Tooltip("pct:Q", title="24h %", format="+.3f"),
-#         ],
-#     )
+# ── Chart builders ────────────────────────────────────────────────────────────
+def comparison_chart(frames: dict[str, pd.DataFrame]) -> alt.Chart | None:
+    """Line chart of close prices rebased to 100 so scales are comparable."""
+    rows = []
+    for symbol, frame in frames.items():
+        if frame.empty:
+            continue
+        base = float(frame["close"].iloc[0])
+        if base <= 0:
+            continue
+        for time, close in zip(frame["time"], frame["close"]):
+            rows.append({"time": time, "symbol": symbol, "close": close, "index": close / base * 100.0})
+    data = pd.DataFrame(rows)
+    if data.empty:
+        return None
+    return (
+        alt.Chart(data)
+        .mark_line()
+        .encode(
+            x=alt.X("time:T", title=None),
+            y=alt.Y("index:Q", title="price (window start = 100)", scale=alt.Scale(zero=False)),
+            color=alt.Color("symbol:N", title=None),
+            tooltip=[
+                alt.Tooltip("symbol:N", title="Symbol"),
+                alt.Tooltip("close:Q", title="Close", format=",.2f"),
+                alt.Tooltip("index:Q", title="Index", format=".2f"),
+                alt.Tooltip("time:T", title="Time"),
+            ],
+        )
+        .properties(height=320)
+        .interactive()
+    )
 
 
-# def tickers_frame(tickers: dict[str, dict]) -> pd.DataFrame:
-#     rows = []
-#     for sym, r in tickers.items():
-#         rows.append({
-#             "Symbol": sym,
-#             "Last": r["last_price"],
-#             "Bid": r["bid_price"],
-#             "Ask": r["ask_price"],
-#             "Spread": spread_of(r),
-#             "24h %": r["pct_change"],
-#             "Open": r["open_price"],
-#             "High": r["high_price"],
-#             "Low": r["low_price"],
-#             "Avg": r["avg_price"],
-#             "Bid Qty": r["bid_qty"],
-#             "Ask Qty": r["ask_qty"],
-#             "Updated": r["timestamp"],
-#         })
-#     return pd.DataFrame(rows)
+def candlestick_chart(frame: pd.DataFrame, title: str) -> alt.Chart:
+    """OHLC candles for a single symbol/interval."""
+    data = frame.tail(MAX_CANDLES)
+    base = alt.Chart(data)
+    wick = base.mark_rule(color="#9aa0a6", strokeWidth=1).encode(
+        x=CANDLE_X,
+        y=alt.Y("low:Q", title="price", scale=alt.Scale(zero=False)),
+        y2="high:Q",
+    )
+    body = base.mark_bar().encode(
+        x=CANDLE_X,
+        y=alt.Y("open:Q", scale=alt.Scale(zero=False)),
+        y2="close:Q",
+        color=alt.condition("datum.open <= datum.close", alt.value(GREEN), alt.value(RED)),
+        tooltip=[
+            alt.Tooltip("time:T", title="Time"),
+            alt.Tooltip("open:Q", title="Open", format=",.2f"),
+            alt.Tooltip("high:Q", title="High", format=",.2f"),
+            alt.Tooltip("low:Q", title="Low", format=",.2f"),
+            alt.Tooltip("close:Q", title="Close", format=",.2f"),
+        ],
+    )
+    return (wick + body).properties(height=320, title=title)
 
 
-# # ── Refresh strategies ────────────────────────────────────────────────────────
-# def wait_for_next_refresh(mode: str) -> None:
-#     """Block until the dashboard should re-render, then trigger a fragment rerun.
-
-#     Live: sleeps until Redis emits a keyspace event (with a heartbeat cap so a
-#     silent Redis still refreshes periodically and errors self-heal).
-#     Fixed modes: sleeps the chosen interval. Off: returns without re-rendering.
-#     """
-#     if mode == "Off" or os.environ.get("STREAMLIT_DASHBOARD_NO_WAIT"):
-#         return
-
-#     if mode == "Live":
-#         tracker = _change_tracker(*st.session_state["_redis_addr"])
-#         if tracker.status == "events":
-#             # Sleep until Redis reports a write to any key (heartbeat cap so a
-#             # silent Redis still refreshes periodically and drops self-heal).
-#             tracker.wait_for_change(tracker.current(), timeout=LIVE_HEARTBEAT)
-#         else:
-#             # Notifications unsupported, or pubsub still connecting: poll fast.
-#             time.sleep(1.0 if tracker.status == "connecting" else LIVE_POLL_FALLBACK)
-#         st.rerun(scope="fragment")
-
-#     seconds = float(mode.rstrip("s"))
-#     time.sleep(seconds)
-#     st.rerun(scope="fragment")
+def change_chart(tickers: dict[str, dict]) -> alt.Chart | None:
+    """Bar chart of the 24h percent change reported by each ticker."""
+    rows = [
+        {"symbol": symbol, "pct": record["pct_change"] or 0.0}
+        for symbol, record in tickers.items()
+    ]
+    if not rows:
+        return None
+    data = pd.DataFrame(rows)
+    return (
+        alt.Chart(data)
+        .mark_bar()
+        .encode(
+            x=alt.X("symbol:N", sort=list(data["symbol"]), title=None),
+            y=alt.Y("pct:Q", title="24h change (%)"),
+            color=alt.condition("datum.pct >= 0", alt.value(GREEN), alt.value(RED)),
+            tooltip=[
+                alt.Tooltip("symbol:N", title="Symbol"),
+                alt.Tooltip("pct:Q", title="24h %", format="+.3f"),
+            ],
+        )
+        .properties(height=320)
+    )
 
 
-# # ── Dashboard fragment ────────────────────────────────────────────────────────
-# @st.fragment
-# def dashboard() -> None:
-#     client, host, port = resolve_redis()
-#     if client is None:
-#         st.error(
-#             "Could not reach Redis. Tried `redis`, `localhost` and `127.0.0.1` on port 6379 — "
-#             "set REDIS_HOST / REDIS_PORT to point somewhere else."
-#         )
-#         return
-#     st.session_state["_redis_addr"] = (host, port)
-
-#     tickers = load_tickers(client, pattern)
-#     if not tickers:
-#         st.warning(f"No Redis keys match `{pattern}`. Waiting for the producer to publish tickers…")
-#         wait_for_next_refresh(st.session_state["_mode"])
-#         return
-
-#     update_history(tickers)
-
-#     newest = max((r["timestamp"] for r in tickers.values() if r["timestamp"] is not None), default=None)
-#     stamp = newest.strftime("%H:%M:%S UTC") if newest is not None else "—"
-#     mode = st.session_state["_mode"]
-#     if mode == "Live":
-#         status = _change_tracker(host, port).status
-#         status_note = {
-#             "events": "listening for Redis changes",
-#             "connecting": "connecting to change stream…",
-#             "polling": f"notifications unavailable — polling every {LIVE_POLL_FALLBACK:g}s",
-#         }[status]
-#         mode_note = f" · live ({status_note})"
-#     elif mode == "Off":
-#         mode_note = " · paused"
-#     else:
-#         mode_note = f" · every {mode}"
-#     st.caption(f"Redis `{host}:{port}` · {len(tickers)} ticker(s) · newest tick {stamp}{mode_note}")
-
-#     # Metric cards, 3 per row
-#     symbols = list(tickers)
-#     for start in range(0, len(symbols), 3):
-#         cols = st.columns(3)
-#         for col, symbol in zip(cols, symbols[start:start + 3]):
-#             record = tickers[symbol]
-#             change = record["pct_change"]
-#             with col:
-#                 st.metric(
-#                     symbol,
-#                     fmt_price(record["last_price"]),
-#                     delta=f"{change:+.2f}%" if change is not None else None,
-#                     border=True,
-#                 )
-#                 st.caption(
-#                     f"24h H {fmt_price(record['high_price'])} · "
-#                     f"L {fmt_price(record['low_price'])} · "
-#                     f"spread {fmt_price(spread_of(record))}"
-#                 )
-
-#     # Charts
-#     chart_col, change_col = st.columns([2, 1], gap="medium")
-#     with chart_col:
-#         st.subheader("Price since page load")
-#         chart = history_chart()
-#         if chart is None:
-#             st.info("Collecting price history… new ticks will appear here automatically.")
-#         else:
-#             st.altair_chart(chart, width="stretch")
-#     with change_col:
-#         st.subheader("24h change")
-#         st.altair_chart(change_chart(tickers), width="stretch")
-
-#     # Full snapshot table
-#     st.subheader("Order book snapshot")
-#     st.dataframe(
-#         tickers_frame(tickers),
-#         hide_index=True,
-#         width="stretch",
-#         column_config={
-#             "Symbol": st.column_config.TextColumn(width="small"),
-#             "Last": st.column_config.NumberColumn(format="%.2f"),
-#             "Bid": st.column_config.NumberColumn(format="%.2f"),
-#             "Ask": st.column_config.NumberColumn(format="%.2f"),
-#             "Spread": st.column_config.NumberColumn(format="%.2f"),
-#             "24h %": st.column_config.NumberColumn(format="%+.2f%%"),
-#             "Open": st.column_config.NumberColumn(format="%.2f"),
-#             "High": st.column_config.NumberColumn(format="%.2f"),
-#             "Low": st.column_config.NumberColumn(format="%.2f"),
-#             "Avg": st.column_config.NumberColumn(format="%.2f"),
-#             "Bid Qty": st.column_config.NumberColumn(format="%.4f"),
-#             "Ask Qty": st.column_config.NumberColumn(format="%.4f"),
-#             "Updated": st.column_config.DatetimeColumn(format="HH:mm:ss"),
-#         },
-#     )
-
-#     wait_for_next_refresh(mode)
+def tickers_frame(tickers: dict[str, dict]) -> pd.DataFrame:
+    rows = []
+    for symbol, record in tickers.items():
+        rows.append({
+            "Symbol": symbol,
+            "Last": record["last_price"],
+            "Bid": record["bid_price"],
+            "Ask": record["ask_price"],
+            "Spread": spread_of(record),
+            "24h %": record["pct_change"],
+            "Open": record["open_price"],
+            "High": record["high_price"],
+            "Low": record["low_price"],
+            "Avg": record["avg_price"],
+            "Bid Qty": record["bid_qty"],
+            "Ask Qty": record["ask_qty"],
+            "Updated": record["timestamp"],
+        })
+    return pd.DataFrame(rows)
 
 
-# # ── Sidebar controls ──────────────────────────────────────────────────────────
-# with st.sidebar:
-#     st.header("Dashboard settings")
-#     st.select_slider(
-#         "Refresh",
-#         options=REFRESH_MODES,
-#         value="Live",
-#         help="Live: re-renders the instant a matching Redis key changes (keyspace events). "
-#              "Other options poll at a fixed rate.",
-#         key="_mode",
-#     )
-#     if st.session_state.get("_mode") == "Live":
-#         addr = st.session_state.get("_redis_addr")
-#         if addr:
-#             status = _change_tracker(*addr).status
-#             st.caption({
-#                 "events": "🟢 event-driven",
-#                 "connecting": "🟡 connecting to change stream…",
-#                 "polling": f"🟡 fallback polling ({LIVE_POLL_FALLBACK:g}s)",
-#             }[status])
-#     pattern = st.text_input("Redis key pattern", value="*ticker")
-#     st.button("🔄 Refresh now", key="_refresh_now")
-#     st.caption("Flow: Binance streams → Kafka → Redis hashes (`HSET`) → this dashboard.")
+def window_summary(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Per-symbol stats over the loaded candle window (count, high/low range, volatility)."""
+    rows = []
+    for symbol, frame in sorted(frames.items()):
+        if frame.empty:
+            continue
+        returns = frame["close"].astype(float).pct_change().dropna()
+        low, high = float(frame["low"].min()), float(frame["high"].max())
+        rows.append({
+            "Symbol": symbol,
+            "Candles": int(len(frame)),
+            "Window": f"{frame['time'].iloc[0]:%H:%M:%S}\u2013{frame['time'].iloc[-1]:%H:%M:%S}",
+            "Low": low,
+            "High": high,
+            "Range": high - low,
+            "Range %": ((high - low) / low * 100.0) if low else None,
+            "Volatility %": float(returns.std() * 100.0) if len(returns) > 1 else None,
+        })
+    return pd.DataFrame(rows)
 
-# st.title("📈 Stonks — live ticker dashboard")
-# dashboard()
+
+def volatility_chart(summary: pd.DataFrame) -> alt.Chart | None:
+    """Horizontal bars of per-symbol volatility, ranked highest first."""
+    if summary.empty or summary["Volatility %"].isna().all():
+        return None
+    data = summary.dropna(subset=["Volatility %"]).sort_values("Volatility %", ascending=False)
+    return (
+        alt.Chart(data)
+        .mark_bar()
+        .encode(
+            y=alt.Y("Symbol:N", sort="-x", title=None),
+            x=alt.X("Volatility %:Q", title="volatility (%) · stdev of returns"),
+            color=alt.Color("Volatility %:Q", scale=alt.Scale(scheme="orangered"), legend=None),
+            tooltip=[
+                alt.Tooltip("Symbol:N", title="Symbol"),
+                alt.Tooltip("Candles:Q", title="Candles"),
+                alt.Tooltip("Range %:Q", title="Range %", format=".3f"),
+                alt.Tooltip("Volatility %:Q", title="Volatility %", format=".4f"),
+            ],
+        )
+        .properties(height=max(160, 60 * len(data)))
+    )
+
+
+# ── Sidebar (static part, must be outside the fragment to change run_every) ───
+with st.sidebar:
+    st.header("Dashboard settings")
+    refresh_mode = st.select_slider(
+        "Refresh",
+        options=list(REFRESH_MODES),
+        value="1s",
+        key="_refresh",
+        help="How often the dashboard re-reads Redis. Data updates without a page reload.",
+    )
+    st.caption("Flow: Binance → Kafka → Redis (hashes + streams) → this dashboard.")
+
+
+# ── Dashboard (fragment re-runs on a timer = real-time updates) ───────────────
+@st.fragment(run_every=REFRESH_MODES[refresh_mode])
+def render_dashboard() -> None:
+    client, host, port = resolve_redis()
+    if client is None:
+        st.error(
+            "Could not reach Redis. Tried `redis`, `localhost` and `127.0.0.1` on port 6379 — "
+            "set `REDIS_HOST` / `REDIS_PORT` to point somewhere else."
+        )
+        if st.button("Retry connection"):
+            st.cache_resource.clear()
+            st.rerun()
+        return
+
+    tickers = load_tickers(client)
+    klines = discover_kline_streams(client)
+    if not tickers and not klines:
+        st.warning("No Redis data yet — waiting for the producer and Kafka Connect sinks…")
+        st.caption(f"Redis `{host}:{port}` · no `ticker:*` hashes or `kline:*` streams found.")
+        return
+
+    # ── Data-dependent controls (inside the fragment so options stay fresh) ──
+    all_symbols = sorted(set(tickers) | set(klines))
+    if not st.session_state.get("symbols") or any(
+        s not in all_symbols for s in st.session_state["symbols"]
+    ):
+        st.session_state["symbols"] = all_symbols
+
+    all_intervals = sorted({iv for ivs in klines.values() for iv in ivs})
+    preferred = "1m" if "1m" in all_intervals else (all_intervals[0] if all_intervals else None)
+    if st.session_state.get("interval") not in all_intervals:
+        st.session_state["interval"] = preferred
+
+    with st.sidebar:
+        st.divider()
+        chosen = st.multiselect("Symbols", all_symbols, key="symbols")
+        interval = st.selectbox("Kline interval", all_intervals, key="interval")
+        st.button("🔄 Refresh now", key="_refresh_now")
+
+    if not chosen:
+        st.info("Select at least one symbol in the sidebar.")
+        return
+
+    # ── Freshness caption ────────────────────────────────────────────────
+    newest_ticker = max(
+        (r["timestamp"] for r in tickers.values() if r["timestamp"] is not None), default=None
+    )
+    frames = {
+        symbol: load_kline(client, symbol, interval)
+        for symbol in chosen
+        if interval in klines.get(symbol, [])
+    }
+    newest_kline = max(
+        (f["time"].max() for f in frames.values() if not f.empty), default=None
+    )
+    stamp = newest_ticker.strftime("%H:%M:%S UTC") if newest_ticker is not None else "—"
+    kline_stamp = newest_kline.strftime("%H:%M:%S UTC") if newest_kline is not None else "—"
+    st.caption(
+        f"Redis `{host}:{port}` · {len(tickers)} ticker(s) · last tick {stamp} · "
+        f"last candle ({interval}) {kline_stamp}"
+        + ("" if refresh_mode == "Off" else f" · refreshing every {refresh_mode}")
+    )
+
+    # ── Metric cards, 3 per row ─────────────────────────────────────────
+    for start in range(0, len(chosen), 3):
+        cols = st.columns(3)
+        for col, symbol in zip(cols, chosen[start:start + 3]):
+            record = tickers.get(symbol)
+            frame = frames.get(symbol)
+            price = record["last_price"] if record else (
+                float(frame["close"].iloc[-1]) if frame is not None and not frame.empty else None
+            )
+            change = record["pct_change"] if record else None
+            with col:
+                st.metric(
+                    symbol,
+                    fmt_price(price),
+                    delta=f"{change:+.2f}%" if change is not None else None,
+                    border=True,
+                )
+                if record:
+                    st.caption(
+                        f"24h H {fmt_price(record['high_price'])} · "
+                        f"L {fmt_price(record['low_price'])} · "
+                        f"spread {fmt_price(spread_of(record))}"
+                    )
+
+    # ── Charts ──────────────────────────────────────────────────────────
+    chart_col, change_col = st.columns([2, 1], gap="medium")
+    with chart_col:
+        st.subheader(f"Close price · {interval}")
+        chart = comparison_chart(frames)
+        if chart is None:
+            st.info(f"No `kline:*:{interval}` data for the selected symbols yet.")
+        else:
+            st.altair_chart(chart, width="stretch")
+            st.caption("All series rebased to 100 at the left edge so different price scales compare.")
+    with change_col:
+        st.subheader("24h change")
+        change = change_chart(tickers)
+        if change is None:
+            st.info("Waiting for ticker data…")
+        else:
+            st.altair_chart(change, width="stretch")
+
+    # ── Window summary ──────────────────────────────────────────────────
+    if frames:
+        st.subheader(f"Window summary · {interval}")
+        summary = window_summary(frames)
+        if summary.empty:
+            st.info("No candles loaded for the selected symbols.")
+        else:
+            table_col, vol_col = st.columns([3, 2], gap="medium")
+            with table_col:
+                st.dataframe(
+                    summary,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Symbol": st.column_config.TextColumn(width="small"),
+                        "Candles": st.column_config.NumberColumn(
+                            format="%d", help=f"Candles loaded (cap {MAX_KLINE_POINTS} per stream)"
+                        ),
+                        "Window": st.column_config.TextColumn(help="First–last candle time (UTC)"),
+                        "Low": st.column_config.NumberColumn(format="%.2f"),
+                        "High": st.column_config.NumberColumn(format="%.2f"),
+                        "Range": st.column_config.NumberColumn(format="%.2f"),
+                        "Range %": st.column_config.NumberColumn(format="%.2f%%"),
+                        "Volatility %": st.column_config.NumberColumn(format="%.3f%%"),
+                    },
+                )
+            with vol_col:
+                st.markdown("**Volatility rank**")
+                vol_chart = volatility_chart(summary)
+                if vol_chart is None:
+                    st.info("Not enough candles to rank volatility yet.")
+                else:
+                    st.altair_chart(vol_chart, width="stretch")
+            st.caption(
+                f"Up to {MAX_KLINE_POINTS} candles per stream · "
+                "volatility = std dev of candle-to-candle close returns."
+            )
+
+    # ── Candlesticks ────────────────────────────────────────────────────
+    st.subheader("Candlesticks")
+    candle_symbol = st.selectbox("Symbol for candles", chosen, key="candle_symbol")
+    candle_frame = frames.get(candle_symbol)
+    if candle_frame is None or candle_frame.empty:
+        st.info(f"No candles for {candle_symbol} at {interval}.")
+    else:
+        st.altair_chart(
+            candlestick_chart(candle_frame, f"{candle_symbol} · {interval}"),
+            width="stretch",
+        )
+        latest = candle_frame.iloc[-1]
+        st.caption(
+            f"{candle_symbol} @ {latest['time']:%H:%M:%S} UTC · "
+            f"O {fmt_price(latest['open'])} · H {fmt_price(latest['high'])} · "
+            f"L {fmt_price(latest['low'])} · C {fmt_price(latest['close'])}"
+        )
+        with st.expander("Raw candle data"):
+            st.dataframe(candle_frame.tail(50), hide_index=True, width="stretch")
+
+    # ── Ticker snapshot ─────────────────────────────────────────────────
+    if tickers:
+        st.subheader("Order book snapshot")
+        st.dataframe(
+            tickers_frame(tickers),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Symbol": st.column_config.TextColumn(width="small"),
+                "Last": st.column_config.NumberColumn(format="%.2f"),
+                "Bid": st.column_config.NumberColumn(format="%.2f"),
+                "Ask": st.column_config.NumberColumn(format="%.2f"),
+                "Spread": st.column_config.NumberColumn(format="%.2f"),
+                "24h %": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Open": st.column_config.NumberColumn(format="%.2f"),
+                "High": st.column_config.NumberColumn(format="%.2f"),
+                "Low": st.column_config.NumberColumn(format="%.2f"),
+                "Avg": st.column_config.NumberColumn(format="%.2f"),
+                "Bid Qty": st.column_config.NumberColumn(format="%.4f"),
+                "Ask Qty": st.column_config.NumberColumn(format="%.4f"),
+                "Updated": st.column_config.DatetimeColumn(format="HH:mm:ss"),
+            },
+        )
+
+
+st.title("📈 Stonks — live market dashboard")
+render_dashboard()

@@ -119,7 +119,8 @@ def send_to_kafka(data, stream_type):
     """Send fully filled, zero-null message to Kafka with symbol as partition key"""
     try:
         partition_key = f"{data['symbol']}"
-        
+        if stream_type == "kline":
+            partition_key = f"{stream_type}:{data['symbol']}:{data['interval']}"
         producer.send(
             topic=stream_type,
             key=partition_key.encode('utf-8'),
