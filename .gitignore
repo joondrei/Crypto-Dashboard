@@ -3,5 +3,4 @@ redis_data/
 kafka_data/
 .venv/
 
-.dockerignore
 poetry.lock

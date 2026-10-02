@@ -1,0 +1,16 @@
+# Development overrides — applied automatically by Compose on top of compose.yaml
+# when you run `docker compose` in this directory.
+#
+# To run exactly what the images contain, ignore this file:
+#   docker compose -f compose.yaml up -d
+
+services:
+  streamlit-app:
+    volumes:
+      - ./scripts:/app/scripts
+
+  producer-app:
+    volumes:
+      - ./scripts:/app/scripts
+      - ./utils:/app/utils
+      - ./configs:/app/configs

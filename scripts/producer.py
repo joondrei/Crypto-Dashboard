@@ -109,10 +109,10 @@ def on_error(ws, error):
     log.error(f"Error establishing websocket connection: {error}")
 
 def on_close(ws, close_status_code, close_msg):
-    print("Connection closed")
+    log.warning(f"WebSocket closed (status={close_status_code}, msg={close_msg}) - reconnecting")
 
 def on_open(ws):
-    print("Connected to Binance Combined Streams API")
+    log.info(f"Connected to Binance Combined Streams API")
 
 def send_to_kafka(data, stream_type):
     """Send fully filled, zero-null message to Kafka with symbol as partition key"""
@@ -151,7 +151,16 @@ if __name__ == "__main__":
     )
     
     log.info("Starting WebSocket execution loop...")
-    ws.run_forever()
+    # ping_interval/ping_timeout are the keepalive: without them a connection that
+    # goes silent (NAT/bridge timeout, a blip, Binance's 24h session cap) leaves
+    # recv() blocked forever — the process stays up, burns no CPU and quietly
+    # stops publishing, because neither on_error nor on_close ever fire.
+    # reconnect makes run_forever re-establish the stream after any drop.
+    ws.run_forever(
+        ping_interval=20,
+        ping_timeout=10,
+        reconnect=5,
+    )
 
     log.info("Flushing remaining Kafka messages...")
     producer.flush(timeout=5)

@@ -1,0 +1,4 @@
+FROM confluentinc/cp-kafka-connect:7.6.0
+
+RUN confluent-hub install --no-prompt redis/redis-kafka-connect:0.9.1 \
+ && confluent-hub install --no-prompt confluentinc/connect-transforms:1.6.2

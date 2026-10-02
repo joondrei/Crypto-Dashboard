@@ -1,5 +1,4 @@
 import json
-import websockets
 
 class StreamLoader:
     def __init__(self, config_path: str):

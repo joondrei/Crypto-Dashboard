@@ -80,7 +80,10 @@ services:
       - app-network
 
   kafka-connect:
-    image: confluentinc/cp-kafka-connect:7.6.0
+    build:
+      context: .
+      dockerfile: connectdocker
+    image: fishtonks-kafka-connect:7.6.0
     container_name: kafka-connect
     depends_on:
       - kafka
@@ -110,11 +113,6 @@ services:
       - bash
       - -c
       - |
-        echo "Installing Redis Connector..."
-        confluent-hub install --no-prompt redis/redis-kafka-connect:latest
-        echo "Installing Connect Transforms SMTs..."
-        confluent-hub install --no-prompt confluentinc/connect-transforms:latest
-        
         /etc/confluent/docker/run &
         
         echo "Waiting for Kafka Connect REST API to boot up..."
@@ -162,11 +160,12 @@ services:
     build:
       context: .
       dockerfile: streamlitdocker
+      args:
+        PIP_INDEX_URL: https://pypi.org/simple
+    image: fishtonks-streamlit:latest
     container_name: streamlit_container
     ports:
       - "8501:8501"
-    volumes:
-      - ./scripts:/app/scripts
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
@@ -176,26 +175,17 @@ services:
   producer-app:
     build:
       context: .
-      dockerfile: streamlitdocker
+      dockerfile: producerdocker
+      args:
+        PIP_INDEX_URL: https://pypi.org/simple
+    image: fishtonks-producer:latest
     container_name: producer_container
-    volumes:
-      - ./scripts:/app/scripts
-      - ./utils:/app/utils
-      - ./configs:/app/configs
     environment:
       - PYTHONUNBUFFERED=1
-      # In-network the broker must be reached on its internal listener; the
-      # advertised localhost:9092 is only valid from the host.
-      - BOOTSTRAP_SERVERS=kafka:29092
+      # - BOOTSTRAP_SERVERS=kafka:29092
     restart: unless-stopped
     networks:
       - app-network
-    healthcheck:
-      disable: true
-    # The image's ENTRYPOINT is exec-form ("streamlit run ..."), and `command`
-    # would only be *appended* to it — the container would start the dashboard
-    # again. Override the entrypoint instead.
-    entrypoint: ["python", "scripts/producer.py"]
     
 
 networks:

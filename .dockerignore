@@ -1,0 +1,16 @@
+# Keep the build context small and the image free of local-only files.
+# The image installs its own dependencies from requirements.txt, and the app
+# source it needs is copied explicitly in the Dockerfile.
+
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+.git/
+.gitignore
+poetry.lock
+
+# Runtime state / notebooks, not part of the image.
+kafka_data/
+redis_data/

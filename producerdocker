@@ -1,0 +1,20 @@
+# Image for the Binance -> Kafka producer (scripts/producer.py).
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements-producer.txt .
+
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=10
+
+RUN pip install --no-cache-dir -r requirements-producer.txt
+
+COPY scripts/producer.py ./scripts/producer.py
+COPY utils/ ./utils/
+COPY configs/ ./configs/
+
+ENTRYPOINT ["python", "scripts/producer.py"]
