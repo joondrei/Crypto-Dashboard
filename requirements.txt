@@ -2,3 +2,5 @@ altair
 pandas
 streamlit
 redis
+kafka-python
+websocket-client

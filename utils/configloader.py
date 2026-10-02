@@ -9,7 +9,12 @@ class ConfigLoader:
         self._load_from_file()
         
     def _load_from_file(self):
-        """Reads the raw file and stores properties internally."""
+        """Reads the raw file and stores properties internally.
+
+        A matching environment variable wins over the file, so one file can serve
+        both worlds: the host talks to ``localhost:9092``, while a container needs
+        the broker's internal listener (``kafka:29092``).
+        """
         if not os.path.exists(self.filepath):
             raise FileNotFoundError(f"Configuration file not found at: {self.filepath}")
             
@@ -20,7 +25,8 @@ class ConfigLoader:
                     continue
                 
                 key, val = line.split('=', 1)
-                self._config[key.strip()] = val.strip()
+                key = key.strip()
+                self._config[key] = os.environ.get(key, val.strip())
 
     # --- Type-Safe Getter Methods ---
 

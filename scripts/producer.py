@@ -5,14 +5,14 @@ import logging
 from kafka import KafkaProducer
 import signal
 import sys
-
-import sys
 from pathlib import Path
 
-# Add the parent directory (project root) to the Python path
-sys.path.append(str(Path.cwd().parent))
-from configloader import ConfigLoader
-from streamloader import StreamLoader
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.configloader import ConfigLoader
+from utils.streamloader import StreamLoader
 
 
 # ── LOGGING ──────────────────────────────────────────────
@@ -22,17 +22,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-streamconfigfile = "stream_config.json"
+streamconfigfile = PROJECT_ROOT / "configs" / "stream_config.json"
 stream_loader = StreamLoader(streamconfigfile)
 
-configfile = "kafka.env"
+configfile = PROJECT_ROOT / "configs" / "kafka.env"
 config = ConfigLoader(configfile)
 producer_config = config.to_kafka_dict()
 
 producer = KafkaProducer(
     **producer_config   
 )  
-
 
 
 ws = None

@@ -5,14 +5,6 @@ Redis sinks -> this dashboard.
 
   * ticker data  -> Redis hashes   ``ticker:<SYMBOL>``      (overwritten every tick)
   * kline data   -> Redis streams  ``kline:<SYMBOL>:<IV>``  (append-only, XADD)
-
-Refresh strategy (keeps the page from repainting nonstop):
-
-  * quotes/cards  -> fast fragment, retimed by the "Refresh (quotes)" control
-  * charts/table  -> slower fragment, retimed by "Refresh (charts)"; chart specs are
-    cached and rebuilt only when the underlying candles actually change
-  * candle reads are incremental: only entries newer than the last seen stream id
-    are fetched, with a periodic full reload to stay self-healing
 """
 
 import os
@@ -26,14 +18,13 @@ import streamlit as st
 # ── Page setup ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Fishtonks · Live Market",
-    # page_icon="📈",
     layout="wide",
 )
 
 GREEN, RED = "#21c354", "#ff4b4b"
-MAX_KLINE_POINTS = 600  # samples kept per symbol/interval stream
-MAX_CANDLES = 150  # candles drawn when the interval is dense (e.g. 1s)
-FULL_RELOAD_SECONDS = 30.0  # periodic full re-read so incremental reads self-heal
+MAX_KLINE_POINTS = 600  
+MAX_CANDLES = 150 
+FULL_RELOAD_SECONDS = 30.0 
 
 TICKER_FIELDS = (
     "bid_price", "bid_qty", "ask_price", "ask_qty",
@@ -41,7 +32,6 @@ TICKER_FIELDS = (
     "open_price", "high_price", "low_price",
 )
 
-# Refresh choices -> value passed to st.fragment(run_every=...)
 REFRESH_MODES = {"1s": "1s", "2s": "2s", "5s": "5s", "10s": "10s", "Off": None}
 
 KLINE_COLUMNS = ["time", "open", "high", "low", "close"]
@@ -101,7 +91,7 @@ def _rows_to_frame(rows) -> pd.DataFrame:
                 float(fields["close_price"]),
             ))
         except (KeyError, TypeError, ValueError):
-            continue  # skip malformed entries rather than break the panel
+            continue  
 
     if not records:
         return pd.DataFrame(columns=KLINE_COLUMNS)
@@ -201,10 +191,8 @@ def spread_of(record: dict) -> float | None:
         return None
     return record["ask_price"] - record["bid_price"]
 
-
-# ...existing code...
 # ── Chart builders ────────────────────────────────────────────────────────────
-COMPARE_ZOOM = "compare_zoom"   # named Altair param; Streamlit reports it back under this key
+COMPARE_ZOOM = "compare_zoom"   
 COMPARE_CHART_KEY = "compare_chart"
 
 
@@ -229,7 +217,7 @@ def reset_compare_view() -> None:
     if not st.session_state.pop("_compare_reset_pending", False):
         return
     st.session_state["_compare_epoch"] = st.session_state.get("_compare_epoch", 0) + 1
-    st.session_state.pop("_rebase_anchors", None)  # re-baseline to the current window
+    st.session_state.pop("_rebase_anchors", None) 
 
 
 def rebase_anchor(symbol: str, frame: pd.DataFrame) -> float:
@@ -291,8 +279,6 @@ def comparison_chart(frames: dict[str, pd.DataFrame]) -> alt.Chart | None:
         .add_params(alt.selection_interval(bind="scales", name=COMPARE_ZOOM))
         .properties(height=320)
     )
-# ...existing code...
-
 
 def candlestick_chart(frame: pd.DataFrame, title: str) -> alt.Chart:
     """OHLC candles for a single symbol/interval."""
@@ -388,7 +374,7 @@ def volatility_chart(summary: pd.DataFrame) -> alt.Chart | None:
     )
 
 
-# ── Chart-spec cache (redraw only when the data actually changed) ─────────────
+# ── Chart-spec cache ─────────────
 def chart_spec(cache_key: str, signature, build):
     """Rebuild a chart only when ``signature`` changes, else reuse the cached object.
 
@@ -425,7 +411,7 @@ def tickers_signature(tickers: dict[str, dict]):
     ))
 
 
-# ── Top level: connect, discover, build the sidebar ───────────────────────────
+# ── Top level: ───────────────────────────
 client, host, port = resolve_redis()
 if client is None:
     st.error(
@@ -486,7 +472,7 @@ if not chosen:
     st.stop()
 
 
-# ── Fast fragment: freshness + quote cards ────────────────────────────────────
+# ── Fast fragment:  ────────────────────────────────────
 FLASH_MS = 650      # how long a quote card stays tinted
 FLASH_TTL = 0.9     # how long the rule survives on the page (one refresh cycle)
 FLASH_TINTS = {"up": "33, 195, 84", "down": "255, 75, 75"}
@@ -539,9 +525,6 @@ def flash_quote_moves(tickers: dict[str, dict]) -> None:
             f".st-key-{quote_container_key(symbol)} [data-testid=\"stMetric\"]"
             f"{{animation:{name} {FLASH_MS}ms ease-out}}"
         )
-    # Emitted every run, empty or not. The cards below live in keyed containers,
-    # and a fragment whose element count changes between runs makes Streamlit
-    # re-insert those containers — which shows up as duplicate rows of cards.
     st.markdown(f"<style>{''.join(rules)}</style>", unsafe_allow_html=True)
 
 
@@ -580,7 +563,7 @@ def render_quotes() -> None:
 # ── Slow fragment: charts, window summary, candlesticks ───────────────────────
 @st.fragment(run_every=REFRESH_MODES[chart_mode])
 def render_klines() -> None:
-    reset_compare_view()  # must run before the chart widget exists again
+    reset_compare_view()  
     frames = {
         symbol: load_kline(client, symbol, interval)
         for symbol in chosen
@@ -589,11 +572,10 @@ def render_klines() -> None:
     tickers = load_tickers(client)
     signature = frames_signature(frames)
 
-    # ...existing code...
     chart_col, change_col = st.columns([2, 1], gap="medium")
     with chart_col:
         st.subheader(f"Close price · {interval}")
-        spec = comparison_chart(frames)   # rebuilt every tick: it carries the data
+        spec = comparison_chart(frames)   
         if spec is None:
             st.info(f"No `kline:*:{interval}` data for the selected symbols yet.")
         else:
@@ -601,7 +583,7 @@ def render_klines() -> None:
                 spec,
                 width="stretch",
                 key=compare_chart_key(),
-                on_select="rerun",   # keeps the element id stable + saves the view state
+                on_select="rerun", 
             )
             st.caption(
                 "Each series is indexed to its first loaded candle = 100, so different price "
@@ -612,7 +594,6 @@ def render_klines() -> None:
                 st.session_state["_compare_reset_pending"] = True
                 st.rerun()
     with change_col:
-            # ...existing code...
         st.subheader("24h change")
         change = chart_spec("change", tickers_signature(tickers), lambda: change_chart(tickers))
         if change is None:

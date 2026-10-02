@@ -158,20 +158,6 @@ services:
         echo "Connectors successfully provisionsed!"
         wait
 
-  jupyter-pyspark:
-    image: jupyter/pyspark-notebook:latest
-    container_name: jupyter-spark
-    ports:
-      - "8888:8888"
-      - "4040:4040"
-    environment:
-      - JUPYTER_ENABLE_LAB=yes
-    volumes:
-      - ./notebooks:/home/jovyan/work
-    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
-    networks:
-      - app-network
-
   streamlit-app:
     build:
       context: .
@@ -180,14 +166,37 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - .:/app
-      - /app/.venv
+      - ./scripts:/app/scripts
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     networks:
       - app-network
 
+  producer-app:
+    build:
+      context: .
+      dockerfile: streamlitdocker
+    container_name: producer_container
+    volumes:
+      - ./scripts:/app/scripts
+      - ./utils:/app/utils
+      - ./configs:/app/configs
+    environment:
+      - PYTHONUNBUFFERED=1
+      # In-network the broker must be reached on its internal listener; the
+      # advertised localhost:9092 is only valid from the host.
+      - BOOTSTRAP_SERVERS=kafka:29092
+    restart: unless-stopped
+    networks:
+      - app-network
+    healthcheck:
+      disable: true
+    # The image's ENTRYPOINT is exec-form ("streamlit run ..."), and `command`
+    # would only be *appended* to it — the container would start the dashboard
+    # again. Override the entrypoint instead.
+    entrypoint: ["python", "scripts/producer.py"]
+    
 
 networks:
   app-network:
