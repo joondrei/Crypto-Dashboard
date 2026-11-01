@@ -2,5 +2,8 @@ __pycache__/
 redis_data/
 kafka_data/
 .venv/
+k8s
 
 poetry.lock
+.env
+kustomization.yaml

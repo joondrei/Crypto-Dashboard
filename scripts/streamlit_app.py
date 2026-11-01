@@ -221,7 +221,7 @@ def reset_compare_view() -> None:
 
 
 def rebase_anchor(symbol: str, frame: pd.DataFrame) -> float:
-    """The price ``symbol``'s index series is anchored to (index 100).
+    """The price ``symbol``'s change series is anchored to (0 %).
 
     Latched on first sight and kept for the session. Do *not* use
     ``frame["close"].iloc[0]`` directly: the loaded window slides, so the first
@@ -236,8 +236,19 @@ def rebase_anchor(symbol: str, frame: pd.DataFrame) -> float:
     return anchor
 
 
+STOCK_PALETTE = (
+    "#2962ff", "#ff9100", "#00b8d4", "#aa00ff", "#ffd600",
+    "#ff4081", "#00c853", "#8d6e63", "#536dfe", "#64dd17",
+)
+
+
 def comparison_chart(frames: dict[str, pd.DataFrame]) -> alt.Chart | None:
-    """Line chart of close prices rebased to 100 so scales are comparable.
+    """Close prices rebased to the first loaded candle (0 %) — stock-chart styling.
+
+    Trading-desk look: signed percentage axis on the *right*, dashed horizontal
+    gridlines and nothing between the panes, a dashed zero baseline to read every
+    series against its open, a tinted area under each line, and a dot + current
+    value tag on the last candle of every symbol.
 
     Rendered through ``st.altair_chart`` on purpose: Streamlit re-sends the spec
     whenever a candle changes, which is what makes the chart update. (A fixed
@@ -245,39 +256,112 @@ def comparison_chart(frames: dict[str, pd.DataFrame]) -> alt.Chart | None:
     frontend inserts a named dataset once and never replaces it — the chart then
     renders its first payload forever.)
     """
-    rows = []
+    parts = []
     for symbol, frame in frames.items():
         if frame.empty:
             continue
         anchor = rebase_anchor(symbol, frame)
         if anchor <= 0:
             continue
-        for t, c in zip(frame["time"], frame["close"]):
-            rows.append({"time": t, "symbol": symbol, "close": c, "index": c / anchor * 100.0})
-    data = pd.DataFrame(rows)
+        closes = frame["close"].astype(float)
+        parts.append(pd.DataFrame({
+            "time": frame["time"],
+            "symbol": symbol,
+            "close": closes,
+            "change": (closes / anchor - 1.0) * 100.0,
+            "zero": 0.0,
+        }))
+    if not parts:
+        return None
+    data = pd.concat(parts, ignore_index=True)
     if data.empty:
         return None
 
+    symbols = list(dict.fromkeys(data["symbol"]))
+    scale = alt.Scale(
+        domain=symbols,
+        range=[STOCK_PALETTE[i % len(STOCK_PALETTE)] for i in range(len(symbols))],
+    )
+    color = alt.Color(
+        "symbol:N",
+        scale=scale,
+        legend=alt.Legend(
+            orient="top", direction="horizontal", title=None,
+            symbolType="stroke", symbolStrokeWidth=2.5, symbolSize=200,
+            labelFontWeight="bold", labelLimit=0, offset=8,
+        ),
+    )
+    color_plain = alt.Color("symbol:N", scale=scale, legend=None)
+
+    # Keep the zero line in frame: a comparison chart is read against the open.
+    lo, hi = float(data["change"].min()), float(data["change"].max())
+    pad = max(abs(lo), abs(hi), 0.05) * 0.12
+    domain = [min(lo, 0.0) - pad, max(hi, 0.0) + pad]
+
+    # Axis config lives on the first layer only — Vega-Lite merges the axis from
+    # the bottom layer, and undefined axis props on the rest contribute nothing.
+    x_plain = alt.X("time:T", title=None)
+    x = alt.X(
+        "time:T",
+        title=None,
+        axis=alt.Axis(
+            grid=False, domain=False, ticks=False,
+            labelPadding=6, labelFontSize=11, labelLineHeight=13,
+            labelExpr="[timeFormat(datum.value, '%H:%M'), timeFormat(datum.value, '%d %b')]",
+        ),
+    )
+    y_scale = alt.Scale(domain=domain, zero=False)
+    y_plain = alt.Y("change:Q", scale=y_scale)
+    y = alt.Y(
+        "change:Q",
+        title="% change vs first loaded candle",
+        scale=y_scale,
+        axis=alt.Axis(
+            orient="right", format="+.2f", tickCount=8,
+            gridDash=[3, 3], gridOpacity=0.35, domain=False, ticks=False,
+            labelFontSize=11, titleFontSize=11, titlePadding=8,
+        ),
+    )
+    tooltips = [
+        alt.Tooltip("symbol:N", title="Symbol"),
+        alt.Tooltip("close:Q", title="Close", format=",.2f"),
+        alt.Tooltip("change:Q", title="Change", format="+.2f"),
+        alt.Tooltip("time:T", title="Time"),
+    ]
+
+    area = alt.Chart(data).mark_area(
+        fillOpacity=0.22 if len(symbols) == 1 else 0.10, line=False,
+    ).encode(x=x, y=y, y2="zero:Q", color=color)
+
+    baseline = alt.Chart(
+        pd.DataFrame({"time": [data["time"].min(), data["time"].max()], "change": [0.0, 0.0]})
+    ).mark_rule(color="#888888", opacity=0.5, strokeDash=[4, 4], strokeWidth=1).encode(
+        x=x_plain, y=y_plain,
+    )
+
+    lines = alt.Chart(data).mark_line(strokeWidth=2, strokeCap="round").encode(
+        x=x_plain, y=y_plain, color=color, tooltip=tooltips,
+    )
+
+    latest = data.sort_values("time").groupby("symbol", as_index=False).tail(1).copy()
+    latest["tag"] = latest["change"].map(lambda v: f"{v:+.2f}%")
+    dots = alt.Chart(latest).mark_point(
+        size=64, filled=True, stroke="white", strokeWidth=1.2,
+    ).encode(x=x_plain, y=y_plain, color=color_plain)
+    tags = alt.Chart(latest).mark_text(
+        align="right", dx=-8, dy=-11, fontSize=11, fontWeight="bold",
+    ).encode(x=x_plain, y=y_plain, text="tag:N", color=color_plain)
+
+    # Invisible points widen the hover target along each line (a 2px stroke is
+    # nearly impossible to hit); they share the dataset, so the spec stays small.
+    hover = alt.Chart(data).mark_point(size=140, opacity=0, filled=True).encode(
+        x=x_plain, y=y_plain, tooltip=tooltips,
+    )
+
     return (
-        alt.Chart(data)
-        .mark_line()
-        .encode(
-            x=alt.X("time:T", title=None),
-            y=alt.Y(
-                "index:Q",
-                title="index (first loaded candle = 100)",
-                scale=alt.Scale(zero=False),
-            ),
-            color=alt.Color("symbol:N", title=None),
-            tooltip=[
-                alt.Tooltip("symbol:N", title="Symbol"),
-                alt.Tooltip("close:Q", title="Close", format=",.2f"),
-                alt.Tooltip("index:Q", title="Index", format=".2f"),
-                alt.Tooltip("time:T", title="Time"),
-            ],
-        )
+        alt.layer(area, baseline, lines, hover, dots, tags)
         .add_params(alt.selection_interval(bind="scales", name=COMPARE_ZOOM))
-        .properties(height=320)
+        .properties(height=360)
     )
 
 def candlestick_chart(frame: pd.DataFrame, title: str) -> alt.Chart:
@@ -586,9 +670,10 @@ def render_klines() -> None:
                 on_select="rerun", 
             )
             st.caption(
-                "Each series is indexed to its first loaded candle = 100, so different price "
-                "scales compare. New candles are swapped in, so panning and zooming survive "
-                "a refresh. The baseline is latched for the session."
+                "Series are plotted as % change from their first loaded candle (0 % line), so "
+                "different price scales line up. Hover for close/change, drag to pan or zoom. "
+                "New candles are swapped in, so panning and zooming survive a refresh. The "
+                "baseline is latched for the session."
             )
             if st.button("Reset view", key="_compare_reset"):
                 st.session_state["_compare_reset_pending"] = True

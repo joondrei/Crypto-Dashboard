@@ -2,8 +2,8 @@ services:
   redis:
     image: redis:7.2-alpine
     container_name: redis
-    ports:
-      - "6379:6379"
+    # ports:
+    #   - "6379:6379"
     volumes:
       - ./redis_data:/data
     command: redis-server --appendonly yes
@@ -14,8 +14,8 @@ services:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka
     hostname: kafka 
-    ports:
-      - "9092:9092"
+    # ports:
+    #   - "9092:9092"
     environment:
       # KRaft Settings
       KAFKA_NODE_ID: 1
@@ -69,8 +69,8 @@ services:
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka_ui
-    ports:
-      - "8080:8080"
+    # ports:
+    #   - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
@@ -165,12 +165,13 @@ services:
     image: fishtonks-streamlit:latest
     container_name: streamlit_container
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8051:8501"
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     networks:
       - app-network
+      - edge
 
   producer-app:
     build:
@@ -186,8 +187,22 @@ services:
     restart: unless-stopped
     networks:
       - app-network
-    
+
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.0
+    container_name: cloudflared
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
+    restart: unless-stopped
+    mem_limit: 256m
+    depends_on:
+      - streamlit-app
+    networks:
+      - edge
+
 
 networks:
   app-network:
+    driver: bridge
+  edge:
     driver: bridge

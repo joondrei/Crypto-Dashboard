@@ -14,3 +14,4 @@ poetry.lock
 # Runtime state / notebooks, not part of the image.
 kafka_data/
 redis_data/
+.env
